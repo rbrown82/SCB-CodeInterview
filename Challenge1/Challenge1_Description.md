@@ -1,36 +1,81 @@
-<p align="center">
-  <a href="https://stylecraft.com" target="_blank" alt="Stylecraft Builders Home"><img src="../img/scb_white-background.png" width="450" /></a>
-</p>
+<#
+.SYNOPSIS
+    Deploys a WLAN profile from an XML file.
 
-# Challenge 1: WLAN Network Deployment
+.DESCRIPTION
+    Adds a Wi-Fi profile to the local computer using a provided XML file.
+    Handles error cases such as missing/malformed XML, profile already existing,
+    and unknown failures.
 
-## Scenario
+.PARAMETER XmlPath
+    Path to the WLAN profile XML file.
 
-You are working in an environment where there are potentially multiple business networks with different WLAN configurations, for example between regions or business units. To help users stay connected as they move between locations, you need to deploy premade WLAN profiles to their computers during initial setup.
+.EXAMPLE
+    .\Deploy-WlanProfile.ps1 -XmlPath "C:\Temp\MyWiFi.xml"
+#>
 
-For simplicity, assume that these are WPA2-PSK networks, rather than enterprise.
+param (
+    [Parameter(Mandatory=$true)]
+    [string]$XmlPath
+)
 
-## Task
+function Write-Status {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    Write-Output "[$Level] $Message"
+}
 
-Write a **Powershell** script to deploy a WLAN profile to a computer. This script should be generic, taking an XML profile file as a parameter.
+# --- Validate the XML file exists ---
+if (-not (Test-Path -Path $XmlPath)) {
+    Write-Status "The XML profile file '$XmlPath' was not found." "ERROR"
+    exit 1
+}
 
-For this scenario, you can assume the script and XML file will be placed locally on the machine before execution and don't need to worry about other deployment details. You can also assume that the script is invoked with SYSTEM privileges.
+# --- Validate the XML is well-formed ---
+try {
+    [xml]$profileXml = Get-Content -Path $XmlPath -ErrorAction Stop
+} catch {
+    Write-Status "The XML profile file '$XmlPath' is malformed or unreadable." "ERROR"
+    exit 2
+}
 
-Make sure to anticipate the following scenarios in addition to success:
+# --- Extract profile name for validation ---
+$profileName = $null
+try {
+    $profileName = $profileXml.WLANProfile.name
+} catch {
+    Write-Status "Unable to read WLAN profile name from XML." "ERROR"
+    exit 3
+}
 
-1. The supplied XML profile is malformed
-2. The supplied XML profile is missing
-3. The network was already added
-4. There was an unknown error
+if (-not $profileName) {
+    Write-Status "The XML does not contain a valid WLAN profile name." "ERROR"
+    exit 4
+}
 
-## Example
+# --- Check if the profile already exists ---
+$existingProfiles = netsh wlan show profiles | Select-String "All User Profile"
+if ($existingProfiles -match $profileName) {
+    Write-Status "Profile '$profileName' already exists. No action taken." "INFO"
+    exit 0
+}
 
-```PowerShell
->>> .\Add-WLANProfile -Path Profile1.xml
-Profile1 has been successfully added!
-```
+# --- Try adding the profile ---
+try {
+    $process = Start-Process -FilePath "netsh.exe" `
+                             -ArgumentList "wlan add profile filename=`"$XmlPath`" user=all" `
+                             -NoNewWindow -Wait -PassThru -ErrorAction Stop
 
-## Helpful Hints
-
-1. Check out [Microsoft Learn](https://learn.microsoft.com) for documentation on adding and removing wireless profiles in Windows.
-2. Use PowerShell for your error checking and scaffolding, but remember it's not the only scripting resource available on Windows.
+    if ($process.ExitCode -eq 0) {
+        Write-Status "Successfully added WLAN profile '$profileName'." "SUCCESS"
+        exit 0
+    } else {
+        Write-Status "Failed to add WLAN profile '$profileName'. Exit code: $($process.ExitCode)" "ERROR"
+        exit 5
+    }
+} catch {
+    Write-Status "An unknown error occurred while adding WLAN profile '$profileName'. $_" "ERROR"
+    exit 6
+}
