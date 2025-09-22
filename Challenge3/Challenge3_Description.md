@@ -1,32 +1,120 @@
-<p align="center">
-  <a href="https://stylecraft.com" target="_blank" alt="Stylecraft Builders Home"><img src="../img/scb_white-background.png" width="450" /></a>
-</p>
+<#
+.SYNOPSIS
+    Retrieve data from the Federal Reserve FRED API and save as JSON.
 
-# Challenge 3: API Calls
+.DESCRIPTION
+    Demonstrates calling a REST API with authentication (API key),
+    saving the response as JSON, and handling suboptimal scenarios:
+      - Network unavailable
+      - API unavailable (5xx, timeout, etc.)
+      - Rate limiting (HTTP 429)
+      - Unexpected errors
+    Also includes simple rate-limit monitoring to avoid overusing the API.
 
-## Scenario
+.NOTES
+    - Requires a FRED API key. You can obtain one free at:
+      https://fred.stlouisfed.org/docs/api/api_key.html
+    - Replace YOUR_API_KEY_HERE with your key or pass it as a parameter.
 
-In your daily work, you may be tasked with using REST APIs for different services. Knowing this, you will need to be comfortable requesting and retrieving data using a REST API.
+.EXAMPLE
+    .\Get-FredSeries.ps1 -ApiKey "abc123" -SeriesId "GNPCA"
+#>
 
-For this task, I would suggest using the Federal Reserve Bank of St. Louis's FRED API. You can freely obtain an API key by creating a free account. **You can use another API if you already have an API key for it and can justify its usage.**
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$ApiKey,
 
-## Task
+    [Parameter(Mandatory = $true)]
+    [string]$SeriesId, # e.g., "GNPCA" for Gross National Product
 
-Write a Powershell script (only PowerShell) that calls out to an API **using an API key** or other form of **authenticated** request, and return the data as a JSON formatted file. You MUST make authenticated requests for this challenge, and cannot make unauthenticated reuqests.
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFile = ".\fred-series.json",
 
-For example, you may want to make a request to get data from a FRED series using your API key, then display that result in a JSON file.
+    [Parameter(Mandatory = $false)]
+    [int]$MinRequestIntervalSeconds = 5
+)
 
-**This is not a data analysis challenge. You do not need to perform any analytics on the data you pull from this API.**
+# --- Simple rate limiting: remember last call ---
+$script:LastApiCall = $null
 
-Please make sure to address suboptimal scenarios, such as:
+function Wait-For-RateLimit {
+    if ($script:LastApiCall) {
+        $elapsed = (New-TimeSpan -Start $script:LastApiCall -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt $MinRequestIntervalSeconds) {
+            $wait = [math]::Ceiling($MinRequestIntervalSeconds - $elapsed)
+            Write-Output "Rate limiting: waiting $wait seconds before next call..."
+            Start-Sleep -Seconds $wait
+        }
+    }
+    $script:LastApiCall = Get-Date
+}
 
-- Network is unavailable
-- API is unavailable
-- API calls have been rate limited due to excessive use (if applicable)
-- Monitoring for and avoiding overusing API calls
-- Unexpected failures elsewhere
+function Get-FredSeriesData {
+    param (
+        [string]$ApiKey,
+        [string]$SeriesId
+    )
 
-## Helpful Resources
+    # Construct URL
+    $url = "https://api.stlouisfed.org/fred/series/observations?series_id=$SeriesId&api_key=$ApiKey&file_type=json"
 
-- [FRED API Documentation](https://fred.stlouisfed.org/docs/api/fred/)
-- [Request or View FRED API Keys](https://fred.stlouisfed.org/docs/api/api_key.html)
+    Wait-For-RateLimit
+
+    try {
+        # Perform request with a timeout
+        $response = Invoke-RestMethod -Uri $url -Method GET -TimeoutSec 15 -ErrorAction Stop
+
+        return $response
+    }
+    catch [System.Net.WebException] {
+        Write-Error "Network or connectivity issue: $($_.Exception.Message)"
+        return $null
+    }
+    catch [System.Net.Http.HttpRequestException] {
+        Write-Error "HTTP request failed: $($_.Exception.Message)"
+        return $null
+    }
+    catch {
+        Write-Error "Unexpected error: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Save-Json {
+    param (
+        $Data,
+        [string]$Path
+    )
+
+    try {
+        $json = $Data | ConvertTo-Json -Depth 5
+        Set-Content -Path $Path -Value $json -Encoding UTF8
+        Write-Output "Data successfully saved to $Path"
+    }
+    catch {
+        Write-Error "Failed to save JSON file: $($_.Exception.Message)"
+    }
+}
+
+# --- Main ---
+Write-Output "Requesting FRED series '$SeriesId'..."
+$data = Get-FredSeriesData -ApiKey $ApiKey -SeriesId $SeriesId
+
+if (-not $data) {
+    Write-Error "No data retrieved. Exiting."
+    exit 1
+}
+
+# Handle possible rate limiting / API-level error messages
+if ($data.error_code -eq 429 -or $data.error_code -eq "rate_limit") {
+    Write-Error "API rate limit exceeded. Try again later."
+    exit 2
+}
+
+if ($data.error_message) {
+    Write-Error "API returned error: $($data.error_message)"
+    exit 3
+}
+
+# Save to JSON
+Save-Json -Data $data -Path $OutputFile
