@@ -1,102 +1,240 @@
-<p align="center">
-  <a href="https://stylecraft.com" target="_blank" alt="Stylecraft Builders Home"><img src="../img/scb_white-background.png" width="450" /></a>
-</p>
+<#
+.SYNOPSIS
+    Parse a blocklist.txt and split entries into categorized .txt files.
 
-# Challenge 2: Domain Blocklist Parsing
+.DESCRIPTION
+    Reads an input blocklist (one item per line; can include comments or URLs),
+    attempts to classify each entry into one of:
+      - Country Code TLDs (two-letter TLDs, e.g. *.ru, .cn)
+      - Top Level Domains (gTLD-like entries, e.g. *.info, .solutions)
+      - Domain-Subdomain patterns (example.com, *.example.com, account-office-protections.example.biz, @.example.com)
+      - Email Addresses (user@domain.tld)
+      - IPv4 Addresses (validated)
+      - IPv6 Addresses (validated)
+    Writes one file per category (UTF-8) with one entry per line. Also writes unmatched.txt
+    for lines the script couldn't classify.
 
-## DISCLAIMER
+.NOTES
+    - The script is conservative: it removes surrounding quotes, URL schemes (http/https),
+      trailing slashes, and inline comments (text after " #") before classification.
+    - Email detection happens before IP detection so "user@192.168.1.1" is treated as an email.
+    - IP detection uses .NET IPAddress.TryParse for robust validation (supports IPv4 and IPv6).
+    - TLD detection accepts lines like "*.info", ".info" or "info" (no other dots). Two-letter
+      TLDs are classified as Country-Code TLDs.
+    - Domain-Subdomain classification is a fallback for anything containing at least one dot
+      that wasn't classified earlier (so "*.example.com" => domain-subdomain; "*.info" =>
+      top-level domain).
+    - Duplicate entries are de-duplicated while preserving first-seen order.
 
-The `blocklist.txt` file was generated using the Python `faker` synthetic data library. This means that this is not real data, and none of the domains, subdomains, email addresses, or IP addresses were meant to have any relation to real data. Any resemblance to real domains, subdomains, email addresses, or IP addresses is coincidental.
+.EXAMPLE
+    .\Split-Blocklist.ps1 -InputFile ".\blocklist.txt" -OutputDir ".\split-output"
 
-**The only exception are the Top-Level Domains, which are from a list of commonly blocked Top-Level Domains based on current threat data.**
+#>
 
-If this file contains real information, please open an issue on this repository so that we can remove that information from this file.
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$InputFile = ".\blocklist.txt",
 
-## Scenario
+    [Parameter(Mandatory=$false)]
+    [string]$OutputDir = ".\split-output"
+)
 
-You are preparing to migrate from one email system to another, and you'd like to somehow take your blocklist with you. Unfortunately, the originating system only lets you export a mix of blocklist items, while your new system needs them split out into categories.
+# --- Utility logging function ---
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR","DEBUG")]
+        [string]$Level = "INFO"
+    )
+    $ts = (Get-Date).ToString("s")
+    Write-Output "[$ts] [$Level] $Message"
+}
 
-Here is an excerpt from your blocklist:
+# --- Validate input file exists ---
+if (-not (Test-Path -Path $InputFile)) {
+    Write-Log "Input file '$InputFile' not found." "ERROR"
+    throw "Input file not found: $InputFile"
+}
 
-```
-*.pl
-burton.carlson-cruz.xyz
-jrice@frazier.net
-mack-peterson.graham-chavez.realestate
-teresa28@harrell.net
-219.247.26.45
-georgetracy@hickman.com
-allen.ca
-millertodd@spence.com
-donnaarroyo@baker.biz
-8a0f:4efb:edcd:465e:3638:6822:f6e0:7cc0
-jenniferross@santos.com
-*.walker.com
-adrianzimmerman@perez.com
-*.palmer.info
-jenniferkhan@kennedy.com
-hopkinsmichael@owens-daniel.com
-zchandler@wright.net
-ltaylor@ford-baxter.com
-```
+# --- Prepare output directory ---
+if (-not (Test-Path -Path $OutputDir)) {
+    New-Item -Path $OutputDir -ItemType Directory | Out-Null
+}
 
-## Task
+# --- Prepare containers for categorized entries (preserve order, uniqueness) ---
+# Using List + HashSet for fast duplication checks while preserving insertion order.
+function New-OrderedSet {
+    $obj = [PSCustomObject]@{
+        List = New-Object 'System.Collections.Generic.List[string]'
+        Set  = New-Object 'System.Collections.Generic.HashSet[string]'
+    }
+    return $obj
+}
+$ccTlds      = New-OrderedSet
+$tlds        = New-OrderedSet
+$domains     = New-OrderedSet
+$emails      = New-OrderedSet
+$ipv4s       = New-OrderedSet
+$ipv6s       = New-OrderedSet
+$unmatched   = New-OrderedSet
 
-Write a Powershell script to ingest the `blocklist.txt` file and create new files with lists from the following categories:
+function Add-If-New {
+    param($container, [string]$value)
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+        # normalize: trim whitespace
+        $v = $value.Trim()
+        if (-not $container.Set.Contains($v)) {
+            $null = $container.Set.Add($v)
+            $null = $container.List.Add($v)
+        }
+    }
+}
 
-1. Country Code TLDs
-    1. *.ru
-    2. *.cn
-    3. *.in
-    4. *.br
-2. Top Level Domains
-    1. *.info
-    2. *.solutions
-    3. *.dad
-    4. *.hello
-3. Domain-Subdomain
-    1. example.com
-    2. *.example.com
-    3. account-office-protections.example.biz
-    4. *@*.example.com, etc.
-4. Email Addresses
-    1. servers.mail.relay@tweetigniter.com
-    2. example123456@gmail.com
-5. IPv4 Addresses
-    1. 96.142.114.238
-    2. 78.149.226.163
-    3. 178.141.167.230
-    4. 169.227.59.103
-    5. 61.4.172.164
-6. IPv6 Addresses
-    1. bacf:b3d0:b1f:9163:ce9f:f580:43b7:a3a6
-    2. f91e:1d4c:1ff4:9b78:8946:3e86:759c:de66
-    3. 8d52:88f1:142c:3fe8:60e7:a114:ec1b:8ca1
-    4. 9e57:4f7a:a0ee:89ae:d453:dd33:4b0d:bb41
-    5. 93cd:59bf:5c94:1cf0:dc98:d2c2:e2ac:f72f
+# Email regex: reasonably strict but not insanely complex (covers common cases).
+# Note: local-part allows many common characters per RFC. This is a pragmatic regex.
+$emailRegex = '^[A-Za-z0-9!#$%&''*+/=?^_`{|}~\.-]+@[A-Za-z0-9\.-]+\.[A-Za-z]{2,63}$'
 
-Each new file should have **one entry per line** and should be in .txt format.
+# Read and process file line-by-line
+$lineNumber = 0
+Get-Content -LiteralPath $InputFile -ErrorAction Stop | ForEach-Object {
+    $lineNumber++
+    $raw = $_
 
-Please thoroughly comment and document your code.
+    # Trim whitespace
+    $line = $raw.Trim()
 
-### Bonus
+    # Skip empty lines
+    if ($line -eq '') { return }
 
-You determine that you will be using Exchange Online Transport Rules to block these items.
+    # Skip comment lines that start with # or ;
+    if ($line -match '^\s*[#;]') { return }
 
-For the TLDs and domains/subdomains file, create a file that contains properly formatted and efficient blocking rules that conform to the limitations of EXO Transport Rules for filtering sender addresses.
+    # Remove inline comments that start with space+#
+    # (keeps '#' if it's part of other tokens; this is a heuristic)
+    if ($line -match '\s+#') {
+        $line = $line -replace '\s+#.*$',''
+        $line = $line.Trim()
+        if ($line -eq '') { return }
+    }
 
-There are character limits for **each line (each entry)**, and for **each rule.** Try using a regular expression such as `\.(first|second|third)\.com$` to describe each line.
+    # Remove surrounding quotes if present
+    if ($line.StartsWith('"') -and $line.EndsWith('"')) {
+        $line = $line.Trim('"')
+    } elseif ($line.StartsWith("'") -and $line.EndsWith("'")) {
+        $line = $line.Trim("'")
+    }
 
-## Example
+    # Remove URL scheme (http:// or https://) if present
+    $line = $line -replace '^(?i)https?://',''
 
-You don't have to use these exact categories, but you should be able to justify how you split your blocklist.
+    # Remove trailing slash if present (common with URL-like entries)
+    if ($line.EndsWith('/')) { $line = $line.TrimEnd('/') }
 
-```PowerShell
->>> .\Parse-BlockList -Path blocklist.txt
-.\output\ccTLD-blocklist.txt has been created with 78 items
-.\output\TLD-blocklist.txt has been created with 44 items
-.\output\domain-subdomain-blocklist.txt has been created with 2918 items
-.\output\email-blocklist.txt has been created with 3028 items
-.\output\ipv4-blocklist.txt has been created with 13 items
-.\output\ipv6-blocklist.txt has been created with 2 items
-```
+    # Remove surrounding square brackets (e.g., [::1] -> ::1)
+    if ($line -match '^\[(.+)\]$') { $line = $matches[1] }
+
+    # Final trim
+    $line = $line.Trim()
+    if ($line -eq '') { return }
+
+    # --- Classification order:
+    #  1) Email addresses
+    #  2) IP addresses (IPv4 / IPv6) validated via .NET
+    #  3) TLD-only patterns like '*.info' or '.ru' or 'info' (no other dots)
+    #     -> TLD length == 2 => country-code TLDs
+    #     -> TLD length >= 3 => top-level domains
+    #  4) Domain/Subdomain patterns (anything with a dot not captured above)
+    #  5) Unmatched
+
+    # 1) Email check
+    if ($line -match $emailRegex) {
+        Add-If-New $emails $line
+        return
+    }
+
+    # 2) IP address check (use TryParse for robust validation)
+    $parsedIP = $null
+    try {
+        $isIp = [System.Net.IPAddress]::TryParse($line, [ref]$parsedIP)
+    } catch {
+        $isIp = $false
+    }
+    if ($isIp) {
+        # IPv4 vs IPv6
+        if ($parsedIP.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            Add-If-New $ipv4s $parsedIP.ToString()
+        } else {
+            Add-If-New $ipv6s $parsedIP.ToString()
+        }
+        return
+    }
+
+    # 3) TLD-only pattern detection
+    # Remove a single leading '*.' or leading '.' if present, then check that there are NO dots left.
+    $candidate = $line -replace '^\*\.', '' -replace '^\.', ''
+    if (($candidate -ne '') -and ($candidate -notmatch '\.') -and ($candidate -match '^[A-Za-z0-9-]{2,63}$')) {
+        # If original form included only optional leading wildcards/dots (no other characters),
+        # and the remainder has no dots, treat as a TLD pattern.
+        # We enforce that the original string contains nothing but optional '*.' or '.' + the label,
+        # i.e., no embedded path, no additional dots.
+        if ($line -match '^(?:\*\.)?\.?[A-Za-z0-9-]{2,63}$') {
+            if ($candidate.Length -eq 2) {
+                Add-If-New $ccTlds $line
+            } else {
+                Add-If-New $tlds $line
+            }
+            return
+        }
+    }
+
+    # 4) Domain/Subdomain detection:
+    # Any remaining string with at least one dot is treated as a domain/subdomain pattern.
+    # This includes patterns like "example.com", "*.example.com", "account-office-protections.example.biz",
+    # and even the unusual "@.example.com" (user requested this grouping).
+    if ($line -match '\.') {
+        Add-If-New $domains $line
+        return
+    }
+
+    # 5) Unmatched lines (store for review)
+    Add-If-New $unmatched $line
+}
+
+# --- Write out files (one entry per line, UTF8) ---
+function Write-ListToFile {
+    param(
+        [Parameter(Mandatory=$true)] $container,
+        [Parameter(Mandatory=$true)][string]$fileName
+    )
+    $filePath = Join-Path -Path $OutputDir -ChildPath $fileName
+    # If no entries, write an empty file (or you can skip; this writes an empty file)
+    if ($container.List.Count -eq 0) {
+        Set-Content -LiteralPath $filePath -Value @() -Encoding UTF8
+    } else {
+        # Write each element preserving the insertion order
+        # Use Set-Content to overwrite existing file
+        Set-Content -LiteralPath $filePath -Value $container.List -Encoding UTF8
+    }
+    Write-Log "Wrote $($container.List.Count) lines to $filePath" "INFO"
+}
+
+Write-ListToFile $ccTlds     "country-code-tlds.txt"
+Write-ListToFile $tlds       "top-level-domains.txt"
+Write-ListToFile $domains    "domain-subdomain.txt"
+Write-ListToFile $emails     "email-addresses.txt"
+Write-ListToFile $ipv4s      "ipv4-addresses.txt"
+Write-ListToFile $ipv6s      "ipv6-addresses.txt"
+Write-ListToFile $unmatched  "unmatched.txt"
+
+# --- Summary to console ---
+Write-Log "Parsing complete." "INFO"
+Write-Log ("Country-code TLDs: {0}" -f $ccTlds.List.Count) "INFO"
+Write-Log ("Top-level domains: {0}" -f $tlds.List.Count) "INFO"
+Write-Log ("Domain/Subdomain entries: {0}" -f $domains.List.Count) "INFO"
+Write-Log ("Email addresses: {0}" -f $emails.List.Count) "INFO"
+Write-Log ("IPv4 addresses: {0}" -f $ipv4s.List.Count) "INFO"
+Write-Log ("IPv6 addresses: {0}" -f $ipv6s.List.Count) "INFO"
+Write-Log ("Unmatched lines: {0} (see unmatched.txt)" -f $unmatched.List.Count) "INFO"
+
+# Exit with success
+return 0
